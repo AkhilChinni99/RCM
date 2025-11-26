@@ -1,0 +1,162 @@
+import json
+from pyspark.sql.functions import col, from_json, explode_outer
+from pyspark.sql.types import ArrayType, StructType, StringType
+
+# ==========================================
+# 1. HELPER: Case-Insensitive Sanitizer
+# ==========================================
+def sanitize_dataframe_columns(df):
+    """
+    Renames columns to ensure uniqueness, IGNORING CASE.
+    Example: [MemberID, memberid] -> [MemberID, memberid_1]
+    This prevents Spark from confusing them later.
+    """
+    cols = df.columns
+    new_cols = []
+    seen_lower = {}
+    for c in cols:
+        c_lower = c.lower()
+        count = seen_lower.get(c_lower, 0)
+        if count == 0:
+            new_cols.append(c)
+        else:
+            new_cols.append(f"{c}_{count}")
+        seen_lower[c_lower] = count + 1
+    return df.toDF(*new_cols)
+def infer_schema_single_row(df, col_name):
+    try:
+        # Try to get up to 10 non-null rows to find valid JSON
+        rows = df.select(f"`{col_name}`").filter(
+            col(f"`{col_name}`").isNotNull() & 
+            (col(f"`{col_name}`") != "")
+        ).limit(10).collect()
+        if not rows:
+            print(f"      ⚠️  No non-null rows found for {col_name}")
+            return None
+        # Try each row until we find valid JSON
+        for row in rows:
+            json_str = row[0]
+            if not isinstance(json_str, str):
+                continue
+            # Handle escaped quotes (common in nested JSON)
+            json_str = json_str.strip()
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                print(f"      ⚠️  JSON parse error in {col_name}: {str(e)[:50]}")
+                continue
+            # Successfully parsed! Now infer schema
+            if isinstance(data, list):
+                if not data:
+                    return "ARRAY<STRING>"
+                # Get schema from first non-null element
+                sample = next((item for item in data if item), None)
+                if not sample or not isinstance(sample, dict):
+                    return "ARRAY<STRING>"
+                keys = sample.keys()
+                is_array = True
+            elif isinstance(data, dict):
+                keys = data.keys()
+                is_array = False
+            else:
+                return None
+            # Build struct schema
+            field_defs = [f"`{k}` STRING" for k in keys]
+            struct_def = f"STRUCT<{', '.join(field_defs)}>"
+            schema = f"ARRAY<{struct_def}>" if is_array else struct_def
+            print(f"      ✓ Inferred schema: {schema[:100]}...")
+            return schema
+        return None
+    except Exception as e:
+        return None
+    
+def looks_like_json(df, col_name, sample_size=5):
+    """Quick check if a string column contains JSON"""
+    try:
+        sample = df.select(f"`{col_name}`").filter(
+            col(f"`{col_name}`").isNotNull() & 
+            (col(f"`{col_name}`") != "")
+        ).limit(sample_size).collect()
+        if not sample:
+            return False
+        for row in sample:
+            s = str(row[0]).strip()
+            # Check if it starts with { or [
+            if s.startswith('{') or s.startswith('['):
+                return True
+        return False
+    except:
+        return False
+def flatten_recursive_final(df, max_loops=20):
+    # STEP 1: Sanitize Input (Case-Insensitive)
+    current_df = sanitize_dataframe_columns(df)
+    for i in range(max_loops):
+        print(f"\n--- Iteration {i+1} ---")
+        has_changed = False
+        select_exprs = []
+        fields = current_df.schema.fields
+        for field in fields:
+            c_name = field.name
+            dtype = field.dataType
+            # CASE A: Struct -> Flatten & Rename (Parent_Child)
+            if isinstance(dtype, StructType) and not has_changed:
+                print(f"   Flattening Struct: {c_name}")
+                # Build select expressions for ALL columns
+                for f2 in fields:
+                    if f2.name == c_name:
+                        # Flatten this struct
+                        for child in dtype.fields:
+                            new_name = f"{c_name}_{child.name}"
+                            select_exprs.append(col(f"`{c_name}`.`{child.name}`").alias(new_name))
+                    else:
+                        # Keep other columns as-is
+                        select_exprs.append(col(f"`{f2.name}`"))
+                has_changed = True
+                break    
+            # CASE B: Array -> Explode
+            elif isinstance(dtype, ArrayType) and not has_changed:
+                print(f"   Exploding Array: {c_name}")
+                current_df = current_df.withColumn(c_name, explode_outer(col(f"`{c_name}`")))
+                has_changed = True
+                break 
+            # CASE C: JSON String -> Parse
+            elif isinstance(dtype, StringType) and not has_changed:
+                # First check if it looks like JSON
+                if looks_like_json(current_df, c_name):
+                    print(f"   Attempting to parse JSON: {c_name}")
+                    ddl = infer_schema_single_row(current_df, c_name)
+                    if ddl:
+                        print(f"      → Parsing with schema")
+                        current_df = current_df.withColumn(c_name, from_json(col(f"`{c_name}`"), ddl))
+                        has_changed = True
+                        break
+                    else:
+                        print(f"      → Could not infer schema, skipping")
+        # Apply struct flattening if needed
+        if has_changed and select_exprs:
+            current_df = current_df.select(select_exprs)
+            current_df = sanitize_dataframe_columns(current_df)
+        if not has_changed:
+            print("\n✅ Flattening Complete.")
+            break 
+    # Final check: List any remaining string columns that look like JSON
+    print("\n--- Final Schema Check ---")
+    remaining_json = []
+    for field in current_df.schema.fields:
+        if isinstance(field.dataType, StringType):
+            if looks_like_json(current_df, field.name, sample_size=3):
+                remaining_json.append(field.name)
+    if remaining_json:
+        print(f"⚠️  Warning: {len(remaining_json)} columns still contain unparsed JSON:")
+        for col_name in remaining_json[:5]:
+            print(f"   - {col_name}")
+        if len(remaining_json) > 5:
+         print(f"   ... and {len(remaining_json) - 5} more")    
+    return current_df
+# 1. Load Data
+df_input = spark.table("dev_bronze_raw.ability_bronze.remits_claims_id_enriched")
+df_final = flatten_recursive_final(df_input, max_loops=30)
+df_final.write.format("delta").mode("overwrite").saveAsTable("dev_bronze_raw.ability_bronze.remits_claims_id_flattened")
+# print(f"\n📊 Final column count: {len(df_final.columns)}")
+# print(f"Columns: {', '.join(df_final.columns[:15])}...")
+display(df_final)
