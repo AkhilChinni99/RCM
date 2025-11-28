@@ -1,0 +1,506 @@
+import requests
+import base64
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import json
+import time
+from pyspark.sql.functions import to_date, col
+from pyspark.sql.functions import current_timestamp
+import logging
+
+--logger info
+def get_logger(name=default_logger_name):
+    logger = logging.getLogger(name)
+    if not logger.hasHandlers():
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s %(levelname)s %(name)s: %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+    
+logger = get_logger()
+
+--Innovalan access tokens
+current_token = None
+token_expiry = 0
+
+def token_header_content(auth_b64, content_type):
+    # Creates headers for token generation requests.
+    headers = {
+        "Authorization": f"Basic {auth_b64}",
+        "Content-Type": content_type
+    }
+    return headers
+
+def create_headers_token(client_id, client_secret):
+    """Creates authorization headers for token generation.
+    Args:
+        client_id (str): The client ID for API authentication
+        client_secret (str): The client secret for API authentication
+    Returns:
+        dict: Headers dictionary containing Authorization and Content-Type
+    Raises: Exception: If encoding fails or parameters are invalid"""
+    try:
+        auth_str = f"{client_id}:{client_secret}"
+        auth_bytes = auth_str.encode("utf-8")
+        auth_b64 = base64.b64encode(auth_bytes).decode("utf-8")
+        headers = token_header_content(auth_b64, content_type)
+        return headers
+    except Exception as e:
+        raise Exception(f"Error in create_headers_token: {str(e)}")
+
+def create_data_token(access_key, access_secret):
+    """Creates data payload for token generation request.
+    Args:
+        access_key (str): The access key username
+        access_secret (str): The access secret password
+    Returns:
+        dict: Data dictionary with grant_type, username, password, and scope
+    Raises:
+        Exception: If data creation fails."""
+    try:
+        data = {
+            "grant_type": "password",
+            "username": access_key,
+            "password": access_secret,
+            "scope": scope
+        }
+        return data
+    except Exception as e:
+        raise Exception(f"Error in create_data_token: {str(e)}")
+
+
+def get_token():
+    """Retrieves an access token from the Inovalon API with intelligent caching.
+    This function implements token caching to avoid unnecessary token generation requests.
+    It reuses existing tokens if they are still valid and only fetches new tokens when:
+    - No token exists
+    - Current token is expiring within 5 minutes
+    Returns:
+        str: The access token string
+    Raises:
+        Exception: If token retrieval fails or returns non-200 status"""
+    global current_token, token_expiry
+    try:
+        now = time.time()
+        # If token exists & not expiring in next 5 minutes → reuse it
+        if current_token and now < token_expiry - 300:
+            remaining = int((token_expiry - now) / 60)
+            return current_token
+
+        headers = create_headers_token(client_id, client_secret)
+        data = create_data_token(access_key, access_secret)
+        response = requests.post(token_url, headers=headers, data=data, timeout=60)
+        
+        if response.status_code != 200:
+            error_msg = f"Token generation FAILED: {response.status_code} {response.text}"
+            raise Exception(error_msg)
+        json_resp = response.json()
+        current_token = json_resp["access_token"]
+
+        # Get expiry time (default to 3600 seconds if not provided)
+        expires_in = json_resp.get("expires_in", 3600)
+        token_expiry = now + expires_in
+
+        expiry_local = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(token_expiry))
+        return current_token
+        
+    except requests.exceptions.Timeout:
+        raise Exception("Token request timed out after 60 seconds")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Network error in get_token: {str(e)}")
+    except KeyError as e:
+        raise Exception(f"Invalid token response format: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Error in get_token: {str(e)}")
+
+
+---Inovalon List Extraction Functions
+
+def create_request_headers(request_mode):
+    """Creates headers for API requests to Inovalon endpoints.
+    Args:
+        request_mode (str): The request mode for the API call
+        account_key (str): The account key for authentication
+        token (str): The bearer token for authorization
+    Returns:
+        dict: Headers dictionary containing accept, X-AccountKey, Authorization, and X-Request-Mode
+    Raises: Exception: If header creation fails."""
+    try:
+        headers = {
+            "accept": accept_key,
+            "X-AccountKey": f"{account_key}",
+            "Authorization": f"Bearer {get_token()}",
+            "X-Request-Mode": request_mode
+        }
+        return headers
+        
+    except Exception as e:
+        raise Exception(f"Error in create_request_headers: {str(e)}")
+
+def date_check(start_dt, end_dt):
+    # Validates and parses start and end date strings, ensuring start <= end.
+    try:
+        if start_dt > end_dt:
+            logger.error("startDate should be lesser than endDate")
+            raise ValueError("startDate should be lesser than endDate")
+    except Exception as ex:
+        logger.error(f"Error in date_check: {str(ex)}")
+        raise ex
+
+def make_get_request(url, headers=None, params=None, retries=3):
+    """ Makes a GET request to the specified URL with error handling, 3 retries.
+    Args:
+        url (str): The URL to send the GET request to
+        headers (dict, optional): Headers to include in the request
+        params (dict, optional): Query parameters for the request
+    Returns:
+        dict: JSON response from the API, or None if request fails
+    Raises: None: Returns None on failure and logs the error."""
+    for attempt in range(0,retries):
+        try:
+            logger.info(f"GET Attempt {attempt}/{retries}: {url}")
+            response = requests.get(url, headers=headers, params=params, timeout=120)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout on attempt {attempt} for URL: {url}")
+            raise 
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error on attempt {attempt}: {e} — Response: {response.text}")
+            raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network-related error on attempt {attempt}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in GET request: {str(e)}")
+            raise
+
+        if attempt < retries:
+            sleep_time = 5
+            time.sleep(sleep_time)
+    logger.error(f"GET request failed after {retries} attempts: {url}")
+    raise Exception(f"GET request failed after {retries} attempts: {url}")
+
+
+def make_get_requestt(url, headers=None, params=None, retries=3):
+    """ Makes a GET request to the specified URL with error handling, 3 retries.
+    Args:
+        url (str): The URL to send the GET request to
+        headers (dict, optional): Headers to include in the request
+        params (dict, optional): Query parameters for the request
+    Returns:
+        dict: JSON response from the API, or None if request fails
+    Raises: None: Returns None on failure and logs the error."""
+    try:
+        for attempt in range(retries):
+            try:
+                logger.info(f"GET Attempt {attempt}/{retries}: {url}")
+                response = requests.get(url, headers=headers, params=params, timeout=120)
+                response.raise_for_status()
+                return response.json()
+            except (requests.exceptions.Timeout, requests.exceptions.HTTPError, requests.exceptions.RequestException, Exception) as e:
+                logger.error(f"Attempt {attempt} failed: {str(e)}")
+                if attempt < retries - 1:
+                    sleep_time = 5
+                    time.sleep(sleep_time)
+                else:
+                    raise
+    except Exception as e:
+        logger.error(f"GET request failed after {retries} attempts: {url}")
+        raise Exception(f"GET request failed after {retries} attempts: {url}")
+
+
+
+def generate_chunks(start_dt, end_dt, mode):
+    """ Generates date chunks based on the specified mode for batch processing.
+    Args:
+        start_dt (datetime): The start date for chunking
+        end_dt (datetime): The end date for chunking
+        mode (str): The chunking mode - "daily", "monthly", "quarterly", or "yearly"
+    Returns:
+        list: List of tuples containing (start_date_str, end_date_str) for each chunk
+    Raises:
+        ValueError: If an invalid mode is provided
+        Exception: If date chunking fails."""
+    try:
+        chunks = []
+        start_timestamp = start_dt
+        while start_timestamp <= end_dt:
+            if mode == chunk_type[0]:
+                end_timestamp = start_timestamp
+                next_start = start_timestamp + timedelta(days=1)
+            elif mode == chunk_type[1]:
+                end_timestamp = (start_timestamp + relativedelta(months=1)) - timedelta(days=1)
+                next_start = start_timestamp + relativedelta(months=1)
+            elif mode == chunk_type[2]:
+                end_timestamp = (start_timestamp + relativedelta(months=3)) - timedelta(days=1)
+                next_start = start_timestamp + relativedelta(months=3)
+            elif mode == chunk_type[3]:
+                end_timestamp = (start_timestamp + relativedelta(years=1)) - timedelta(days=1)
+                next_start = start_timestamp + relativedelta(years=1)
+            else:
+                logger.error(f"Invalid mode '{mode}'. Choose from " + ", ".join(chunk_type))
+                raise ValueError(f"Invalid mode '{mode}'. Choose from " + ", ".join(chunk_type))
+            if end_timestamp > end_dt:
+                end_timestamp = end_dt
+            chunks.append((
+                start_timestamp.strftime("%Y-%m-%d"),
+                end_timestamp.strftime("%Y-%m-%d")
+            ))
+            start_timestamp = next_start
+        logger.info(f"Total chunks generated: {len(chunks)}")
+        return chunks
+    except ValueError as ve:
+        logger.error(f"Error in generate_chunks: {str(ve)}")
+        raise ValueError(f"Error in generate_chunks: {str(ve)}")
+    except Exception as e:
+        logger.error(f"Error in generate_chunks: {str(e)}")
+        raise Exception(f"Error in generate_chunks: {str(e)}")
+
+def generate_url(url_type, **kwargs):
+    try:
+        if url_type == url_type_config[0]:
+            url = (f"{kwargs['endpoint_url']}?created={kwargs['start']},{kwargs['end']}"
+                   f"&limit={kwargs['limit']}&offset={kwargs['offset']}")
+            return url
+        elif url_type == url_type_config[1]:
+            url = f"{kwargs['url']}/{kwargs['id']}"
+            return url
+        else:
+            logger.error(f"Invalid url_type: {url_type}")
+            raise ValueError("Invalid url_type")
+    except Exception as e:
+        logger.error(f"Error in generate_url: {str(e)}")
+        raise Exception(f"Error in generate_url: {str(e)}")
+
+def fetch_records(endpoint_url, headers, start_timestamp, end_timestamp, limit=200, max_offset=10000):
+    """ Fetches all records from an API endpoint for a given date range with pagination.
+    Args:
+        endpoint_url (str): The API endpoint URL
+        headers (dict): Headers for the API request
+        start_timestamp (str): Start date in YYYY-MM-DD format
+        end_timestamp (str): End date in YYYY-MM-DD format
+        limit (int, optional): Number of records per page. Defaults to 200
+        max_offset (int, optional): Maximum offset for pagination. Defaults to 10000
+    Returns:
+        list: List of all fetched records
+    Raises: Exception: If fetching records fails"""
+    try:
+        all_records = []
+        offset = 0
+        while True:
+            url = generate_url(url_type=url_type_config[0], endpoint_url=endpoint_url, start=start_timestamp, end=end_timestamp, limit=limit, offset=offset)
+            logger.info(f"Fetching records with offset {offset}: {url}")
+            data = make_get_request(url, headers)
+            records = data.get("records", []) if data else []
+            logger.info(f"Fetched {len(records)} records at offset {offset}")
+            if not records:
+                logger.info(f"No more records found at offset {offset}. Stopping pagination.")
+                break   
+            all_records.extend(records)
+            offset += limit
+            if offset >= max_offset or len(records) < limit:
+                logger.info(f"Reached max_offset or last page at offset {offset}. Stopping pagination.")
+                break
+        logger.info(f"Total records fetched: {len(all_records)}")
+        return all_records
+    except Exception as e:
+        logger.error(f"Error in fetch_records: {str(e)}")
+        raise Exception(f"Error in fetch_records: {str(e)}")
+
+def write_json_to_dbfs(full_path, json_str):
+    """ Writes a JSON string to the specified DBFS path."""
+    try:
+        with open(full_path, "w") as f:
+            f.write(json_str)
+        logger.info(f"Successfully wrote JSON to DBFS: {full_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error writing JSON to DBFS: {str(e)}")
+        raise Exception(f"Error writing JSON to DBFS: {str(e)}")
+
+def save_list_records_to_dbfs(records, file_name, start_timestamp, end_timestamp, base_path):
+    """Saves API records to DBFS as a JSON file for the given date range."""
+    try:
+        json_str = json.dumps(records, indent=2)
+        file_name = f"{file_name}_{start_timestamp}_{end_timestamp}.json"
+        full_path = base_path + file_name
+        write_json_to_dbfs(full_path, json_str)
+        return True
+    except Exception as e:
+        logger.error(f"Error saving records to DBFS: {str(e)}")
+        raise Exception(f"Error saving records to DBFS: {str(e)}")
+
+def request_endpoint(start_date_str,
+                    end_date_str,
+                    url,
+                    chunks,
+                    request_mode,
+                    file_name,
+                    volume_path):
+    """Requests data from API endpoint for all date chunks and saves to DBFS volume.
+    Args:
+        start_date_str (str): Start date string
+        end_date_str (str): End date string
+        url (str): API endpoint URL
+        chunks (list): List of date range tuples
+        request_mode (str): Request mode for API
+        name (str): Name prefix for saved files
+        volume_path (str): Path to DBFS volume for saving files
+        account_key (str): Account key for authentication
+        token (str): Bearer token for authorization
+    Returns:
+        str: Success or failure message
+    Raises: Exception: If saving data fails."""
+    try:
+        api_url = url
+        base_path = volume_path
+        saved_files = 0
+        failed_chunks = []
+        for start_timestamp, end_timestamp in chunks:
+            try:
+                headers = create_request_headers(request_mode)
+                records = fetch_records(api_url, headers, start_timestamp, end_timestamp)
+                if records:                    
+                    status = save_list_records_to_dbfs(records, file_name, start_timestamp, end_timestamp, base_path)
+                    if status:
+                        saved_files += 1
+
+            except Exception as e:
+                logger.error(f"Failed to process chunk {start_timestamp} to {end_timestamp}: {str(e)}")
+                failed_chunks.append((start_timestamp, end_timestamp))
+                continue
+        if failed_chunks:
+            logger.error(f"Partially saved to DBFS volume. {saved_files} files saved, {len(failed_chunks)} chunks failed.")
+        logger.info(f"Saved to DBFS volume successfully. Total files: {saved_files}")
+    except Exception as e:
+        logger.error(f"Failed to save data to DBFS: {str(e)}")
+        raise Exception(f"Failed to save data to DBFS: {str(e)}")
+
+    
+def inovalon_list_extraction(url,start_dt,end_dt,mode,request_mode,file_name,volume_path):
+    """Main function to extract data from Inovalon API and save to DBFS volume.
+    This function orchestrates the entire extraction process:
+    1. Validates and parses date parameters
+    2. Generates date chunks based on mode
+    3. Retrieves authentication token
+    4. Fetches data for each chunk
+    5. Saves data to DBFS volume
+    Returns:
+        str: Success or failure message with details
+    Raises:
+        Exception: If extraction process fails at any stage."""
+
+    try:
+        start_dt = datetime.strptime(start_dt, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_dt, "%Y-%m-%d")
+        date_check(start_dt, end_dt)
+        chunks = generate_chunks(start_dt, end_dt, mode)
+        result= request_endpoint(start_dt, end_dt,url, chunks, request_mode, file_name, volume_path)
+        return result
+    except ValueError as ve:
+        raise Exception(f"Invalid date parameters: {str(ve)}")
+    except Exception as e:
+        raise Exception(f"Extraction failed: {str(e)}")
+
+--Innovalan id extractions
+def extract_unique_ids(table,column_name):
+    """Extracts a list of unique IDs from the specified Spark table."""
+    try:
+        logger.info(f"Extracting unique IDs from table: {table}, column: {column_name}")
+        df = spark.table(table).filter(col("_active_flag") == 1).select(f"{column_name}")
+        unique_ids_df = df.distinct()
+        id_list = [row[f"{column_name}"] for row in unique_ids_df.collect()]
+        logger.info(f"Extracted {len(id_list)} unique IDs from {table}")
+        return id_list
+    except Exception as e:
+        logger.error(f"Error extracting unique IDs: {table} {str(e)}")
+        raise Exception(f"Error extracting unique IDs: {table} {str(e)}")
+
+def save_id_record_to_dbfs(data, name, id_value, volume_path):
+    """Saves API data for a single ID to DBFS as a JSON file."""
+    try:
+        json_str = json.dumps(data, indent=2)
+        file_name = f"{name}_{id_value}.json"
+        full_path = volume_path + file_name
+        if write_json_to_dbfs(full_path, json_str):
+            logger.info(f"Saved record for ID {id_value} to DBFS: {full_path}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to save record for ID {id_value} to DBFS: {str(e)}")
+        return False
+
+def request_endpoint_id(url, name, volume_path, id_list,request_mode):
+    """Requests data from API endpoint for each ID and saves to DBFS volume.
+    Args:
+        url (str): Base API endpoint URL
+        name (str): Name prefix for saved files
+        volume_path (str): Path to DBFS volume for saving files
+        id_list (list): List of IDs to extract data for
+        request_mode (str): Request mode for API
+    Returns: str: Success or failure message with statistics
+    Raises: Exception: If critical error occurs during processing"""
+    try:
+        saved_files = 0
+        failed_ids = []
+        logger.info(f"Starting ID-based extraction for {len(id_list)} IDs")
+        for id_value in id_list:
+            try:
+                headers = create_request_headers(request_mode)
+                id_url = generate_url(url_type_config[1], url=url, id=id_value)
+                logger.info(f"Requesting data for ID {id_value} from URL: {id_url}")
+                data = make_get_request(id_url, headers)
+                if data:
+                    status = save_id_record_to_dbfs(data, name, id_value, volume_path)
+                    if status:
+                        saved_files += 1
+                    else:
+                        failed_ids.append(id_value)
+            except Exception as e:
+                error_msg = f"Failed to process ID {id_value}: {str(e)}"
+                logger.error(error_msg)
+                failed_ids.append(id_value)
+                continue
+        if failed_ids:
+            logger.warning(f"Partially saved to DBFS volume. {saved_files} files saved, {len(failed_ids)} IDs failed.")
+            return f"Partially saved to DBFS volume. {saved_files} files saved, {len(failed_ids)} IDs failed."
+        logger.info(f"Saved to DBFS volume successfully. Total files: {saved_files}")
+        return f"Saved to DBFS volume successfully. Total files: {saved_files}"
+        
+    except Exception as e:
+        logger.error(f"Failed to save ID-based data to DBFS: {str(e)}")
+        raise Exception(f"Failed to save ID-based data to DBFS: {str(e)}")
+
+
+def inovalon_id_extraction(url, name, volume_path, list_table , id_table ,request_mode):
+    """Main function to extract data from Inovalon API based on IDs from a table.
+    This function:
+    1. Reads IDs from a Spark table
+    2. Extracts unique IDs
+    3. Fetches data for each ID from the API
+    4. Saves data to DBFS volume
+    Returns:str: Success or failure message with details
+    Raises:Exception: If extraction process fails at any stage"""
+    try:
+        logger.info(f"Starting extraction for IDs from {list_table}, checking against {table}")
+        id_list_to_extract = extract_unique_ids(list_table,"id")
+        id_list_already_exists = extract_unique_ids(id_table,"transid")
+
+        id_list_to_extract = list(map(int, id_list_to_extract))
+        id_list_already_exists = list(map(int, id_list_already_exists))
+        id_list = list(set(id_list_to_extract) - set(id_list_already_exists))
+
+        logger.info(f"IDs to extract: {len(id_list)}")
+        if not id_list:
+            logger.info("No IDs found to extract")
+            return "No IDs found to extract"
+        result = request_endpoint_id(url, name, volume_path, id_list, request_mode)
+        logger.info(f"Extraction result: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"ID-based extraction failed: {str(e)}")
+        raise Exception(f"ID-based extraction failed: {str(e)}")
